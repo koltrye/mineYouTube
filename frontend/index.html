@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MineTube</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <button class="icon-button menu-button" aria-label="Menu">☰</button>
+    <a class="logo" href="#/"><span class="logo-mark">▶</span><span>MineTube</span></a>
+    <form id="searchForm" class="search">
+      <input id="searchInput" type="search" placeholder="Search">
+      <button type="submit" aria-label="Search">⌕</button>
+    </form>
+    <div class="top-actions">
+      <button id="uploadTop" class="icon-button" title="Upload">＋</button>
+      <button id="authButton" class="signin">Sign in</button>
+    </div>
+  </header>
+  <aside id="sidebar" class="sidebar">
+    <nav>
+      <a class="nav-item active" href="#/"><span>⌂</span><b>Home</b></a>
+      <a class="nav-item" href="#/subscriptions"><span>▻</span><b>Subscriptions</b></a>
+      <a class="nav-item" href="#/moderation"><span>⚑</span><b>Moderation</b></a>
+      <a class="nav-item" href="#/"><span>◉</span><b>You</b></a>
+    </nav>
+  </aside>
+  <main id="app"></main>
+
+  <dialog id="authDialog">
+    <form id="authForm" method="dialog">
+      <button type="button" class="close-dialog" id="closeAuth">×</button>
+      <h2 id="authTitle">Sign in</h2>
+      <label>Email<input name="email" type="email" required></label>
+      <label>Password<input name="password" type="password" minlength="6" required></label>
+      <div id="registerFields" hidden>
+        <label>Username<input name="username" minlength="3"></label>
+        <label>Display name<input name="display_name"></label>
+      </div>
+      <button class="primary wide" type="submit">Continue</button>
+      <button type="button" id="authSwitch" class="text-button">Create account</button>
+    </form>
+  </dialog>
+  <dialog id="uploadDialog">
+    <form id="uploadForm">
+      <button type="button" class="close-dialog" id="closeUpload">×</button>
+      <h2>Upload video</h2>
+      <label>Video file<input name="file" type="file" accept="video/*" required></label>
+      <label>Title<input name="title" maxlength="200" required></label>
+      <label>Description<textarea name="description" rows="4"></textarea></label>
+      <label>Visibility
+        <select name="visibility"><option value="public">Public</option><option value="private">Private</option></select>
+      </label>
+      <div id="uploadProgress" hidden><progress max="100" value="0"></progress><span>0%</span></div>
+      <button class="primary wide" type="submit">Upload</button>
+    </form>
+  </dialog>
+  <script src="/app.js"></script>
+</body>
+</html>
