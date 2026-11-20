@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
@@ -22,8 +22,27 @@ def verify_password(password: str, password_hash: str) -> bool:
 
 
 def create_token(user_id: int) -> str:
-    expires = datetime.utcnow() + timedelta(minutes=settings.access_token_minutes)
+    expires = datetime.now(timezone.utc) + timedelta(minutes=settings.access_token_minutes)
     return jwt.encode({"sub": str(user_id), "exp": expires}, settings.jwt_secret, algorithm=settings.jwt_algorithm)
+
+
+def create_stream_ticket(video_id: int, user_id: int | None) -> str:
+    expires = datetime.now(timezone.utc) + timedelta(minutes=30)
+    return jwt.encode(
+        {"kind": "video_stream", "video_id": str(video_id), "sub": str(user_id) if user_id else "public", "exp": expires},
+        settings.jwt_secret,
+        algorithm=settings.jwt_algorithm,
+    )
+
+
+def verify_stream_ticket(ticket: str, video_id: int) -> int | None:
+    try:
+        payload = jwt.decode(ticket, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
+        if payload.get("kind") != "video_stream" or payload.get("video_id") != str(video_id):
+            raise ValueError("Ticket scope mismatch")
+        return None if payload.get("sub") == "public" else int(payload["sub"])
+    except (JWTError, KeyError, TypeError, ValueError):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Video not found")
 
 
 def get_current_user(

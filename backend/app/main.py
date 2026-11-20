@@ -1,33 +1,26 @@
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, status
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Request
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import or_, func
 from sqlalchemy.orm import Session
 import os
+import subprocess
+import tempfile
+import secrets
+import re
 
 from .database import engine, Base, get_db
 from .models import (
-    Comment, Report, Role, Subscription, User, Video, VideoLike,
+    Comment, Playlist, PlaylistVideo, Report, Role, Subscription, User, Video, VideoLike,
     VideoPermission, Visibility, VideoStatus,
 )
-from .auth import create_token, get_current_user, get_optional_user, hash_password, verify_password
-from .config import settings
-from .storage import presigned_url, put_object
+from .auth import create_stream_ticket, create_token, get_current_user, get_optional_user, hash_password, verify_password, verify_stream_ticket
+from .storage import delete_object, get_object, object_size, put_object
 
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="MineTube", version="1.0.0", docs_url="/docs")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
 class RegisterRequest(BaseModel):
     username: str
     email: str
@@ -52,9 +45,31 @@ class PermissionRequest(BaseModel):
     username: str
 
 
-def public_url(key: str) -> str:
-    url = presigned_url(key)
-    return url.replace(settings.s3_endpoint, settings.s3_public_endpoint)
+class PlaylistRequest(BaseModel):
+    title: str
+    description: str = ""
+    visibility: str = "public"
+
+
+class PlaylistItemRequest(BaseModel):
+    video_id: int
+
+
+def playlist_json(playlist: Playlist, db: Session, user: User | None):
+    items = [
+        serialize_video(item.video, db, user)
+        for item in playlist.items
+        if can_view(item.video, user, db)
+    ]
+    return {
+        "id": playlist.id,
+        "title": playlist.title,
+        "description": playlist.description,
+        "visibility": playlist.visibility.value,
+        "owner": {"username": playlist.owner.username, "display_name": playlist.owner.display_name},
+        "videos": items,
+        "video_count": len(items),
+    }
 
 
 def can_view(video: Video, user: User | None, db: Session) -> bool:
@@ -84,11 +99,12 @@ def serialize_video(video: Video, db: Session, user: User | None = None):
         "visibility": video.visibility.value,
         "status": video.status.value,
         "views": video.views,
+        "duration_seconds": video.duration_seconds,
         "likes": likes,
         "comments": comments,
         "created_at": video.created_at.isoformat(),
-        "thumbnail_url": public_url(video.thumbnail_key) if video.thumbnail_key else None,
-        "video_url": public_url(video.object_key),
+        "thumbnail_url": f"/api/videos/{video.id}/thumbnail?ticket={create_stream_ticket(video.id, user.id if user else None)}" if video.thumbnail_key else None,
+        "video_url": f"/api/videos/{video.id}/stream?ticket={create_stream_ticket(video.id, user.id if user else None)}",
         "liked": bool(user and db.query(VideoLike).filter_by(video_id=video.id, user_id=user.id).first()),
     }
 
@@ -98,11 +114,16 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)):
     username = payload.username.strip()
     if len(username) < 3:
         raise HTTPException(400, "Username must be at least 3 characters")
-    if db.query(User).filter(or_(User.username == username, User.email == payload.email.strip().lower())).first():
+    if len(payload.password) < 8:
+        raise HTTPException(400, "Password must be at least 8 characters")
+    email = payload.email.strip().lower()
+    if len(email) > 255 or not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+        raise HTTPException(400, "A valid email is required")
+    if db.query(User).filter(or_(User.username == username, User.email == email)).first():
         raise HTTPException(409, "User already exists")
     user = User(
         username=username,
-        email=payload.email.strip().lower(),
+        email=email,
         password_hash=hash_password(payload.password),
         display_name=(payload.display_name or username).strip(),
     )
@@ -127,9 +148,9 @@ def me(user: User = Depends(get_current_user)):
 
 @app.get("/api/videos")
 def feed(db: Session = Depends(get_db), user: User | None = Depends(get_optional_user), q: str = ""):
-    query = db.query(Video).filter(Video.status != VideoStatus.hidden)
+    query = db.query(Video).filter(Video.status == VideoStatus.ready)
     if q:
-        query = query.filter(or_(Video.title.ilike(f"%{q}%"), Video.description.ilike(f"%{q}%")))
+        query = query.filter(Video.title.ilike(f"%{q}%"))
     videos = query.order_by(Video.created_at.desc()).all()
     visible = [video for video in videos if can_view(video, user, db)]
     return [serialize_video(video, db, user) for video in visible]
@@ -145,10 +166,85 @@ def get_video(video_id: int, db: Session = Depends(get_db), user: User | None = 
     return serialize_video(video, db, user)
 
 
-@app.post("/api/videos/{video_id}/view")
-def count_view(video_id: int, db: Session = Depends(get_db)):
+def authorized_stream_video(video_id: int, ticket: str, db: Session):
     video = db.get(Video, video_id)
-    if not video:
+    user_id = verify_stream_ticket(ticket, video_id)
+    user = db.get(User, user_id) if user_id is not None else None
+    if not video or (user_id is not None and not user) or not can_view(video, user, db):
+        raise HTTPException(404, "Video not found")
+    return video
+
+
+@app.get("/api/videos/{video_id}/stream")
+def stream_video(video_id: int, request: Request, ticket: str, db: Session = Depends(get_db)):
+    video = authorized_stream_video(video_id, ticket, db)
+    range_header = request.headers.get("range")
+    range_start = range_end = None
+    if range_header:
+        try:
+            unit, value = range_header.split("=", 1)
+            if unit != "bytes" or "," in value:
+                raise ValueError
+            start_text, end_text = value.split("-", 1)
+            total = object_size(video.object_key)
+            if not start_text:
+                suffix_length = int(end_text)
+                if suffix_length <= 0:
+                    raise ValueError
+                range_start = max(0, total - suffix_length)
+                range_end = total - 1
+            else:
+                range_start = int(start_text)
+                range_end = min(int(end_text), total - 1) if end_text else total - 1
+            if range_start < 0 or range_start >= total or range_end < range_start:
+                raise ValueError
+        except (ValueError, IndexError):
+            total = object_size(video.object_key)
+            return Response(status_code=416, headers={"Content-Range": f"bytes */{total}"})
+        range_header = f"bytes={range_start}-{range_end}"
+
+    stored = get_object(video.object_key, range_header)
+    body = stored["Body"]
+
+    def chunks():
+        try:
+            yield from body.iter_chunks(chunk_size=1024 * 1024)
+        finally:
+            body.close()
+
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Length": str(stored["ContentLength"]),
+        "Content-Type": stored.get("ContentType", "video/mp4"),
+    }
+    if range_start is not None:
+        headers["Content-Range"] = f"bytes {range_start}-{range_end}/{total}"
+    return StreamingResponse(
+        chunks(),
+        status_code=206 if range_start is not None else 200,
+        headers=headers,
+        media_type=stored.get("ContentType", "video/mp4"),
+    )
+
+
+@app.get("/api/videos/{video_id}/thumbnail")
+def video_thumbnail(video_id: int, ticket: str, db: Session = Depends(get_db)):
+    video = authorized_stream_video(video_id, ticket, db)
+    if not video.thumbnail_key:
+        raise HTTPException(404, "Thumbnail not found")
+    stored = get_object(video.thumbnail_key)
+    body = stored["Body"]
+    try:
+        content = body.read()
+    finally:
+        body.close()
+    return Response(content=content, media_type=stored.get("ContentType", "image/jpeg"))
+
+
+@app.post("/api/videos/{video_id}/view")
+def count_view(video_id: int, db: Session = Depends(get_db), user: User | None = Depends(get_optional_user)):
+    video = db.get(Video, video_id)
+    if not video or not can_view(video, user, db):
         raise HTTPException(404, "Video not found")
     video.views += 1
     db.commit()
@@ -173,15 +269,18 @@ def toggle_like(video_id: int, db: Session = Depends(get_db), user: User = Depen
 
 
 @app.get("/api/videos/{video_id}/comments")
-def comments(video_id: int, db: Session = Depends(get_db)):
+def comments(video_id: int, db: Session = Depends(get_db), user: User | None = Depends(get_optional_user)):
+    video = db.get(Video, video_id)
+    if not video or not can_view(video, user, db):
+        raise HTTPException(404, "Video not found")
     rows = db.query(Comment).filter(Comment.video_id == video_id).order_by(Comment.created_at.desc()).all()
     return [{"id": r.id, "text": r.text, "created_at": r.created_at.isoformat(), "user": {"id": r.user.id, "username": r.user.username, "display_name": r.user.display_name}} for r in rows]
 
 
 @app.post("/api/videos/{video_id}/comments")
 def add_comment(video_id: int, payload: CommentRequest, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    if not payload.text.strip():
-        raise HTTPException(400, "Comment cannot be empty")
+    if not payload.text.strip() or len(payload.text) > 5000:
+        raise HTTPException(400, "Comment must be between 1 and 5000 characters")
     video = db.get(Video, video_id)
     if not video or not can_view(video, user, db):
         raise HTTPException(404, "Video not found")
@@ -193,7 +292,7 @@ def add_comment(video_id: int, payload: CommentRequest, db: Session = Depends(ge
 
 
 @app.post("/api/videos/upload")
-async def upload(
+def upload(
     file: UploadFile = File(...),
     title: str = Form(...),
     description: str = Form(""),
@@ -209,17 +308,75 @@ async def upload(
         vis = Visibility(visibility)
     except ValueError:
         raise HTTPException(400, "Invalid visibility")
-    data = await file.read()
-    if len(data) > 1024 * 1024 * 500:
-        raise HTTPException(413, "Video exceeds 500 MB")
-    ext = os.path.splitext(file.filename)[1].lower() or ".mp4"
-    key = f"videos/{user.id}/{title.strip().lower().replace(' ', '-')}-{os.urandom(4).hex()}{ext}"
-    put_object(key, data, file.content_type)
-    video = Video(owner_id=user.id, title=title.strip(), description=description.strip(), object_key=key, visibility=vis, status=VideoStatus.ready)
-    db.add(video)
-    db.commit()
-    db.refresh(video)
-    return serialize_video(video, db, user)
+    clean_title = title.strip()
+    if not clean_title or len(clean_title) > 200:
+        raise HTTPException(400, "Title must be between 1 and 200 characters")
+
+    video_key = f"videos/{user.id}/{secrets.token_hex(16)}.mp4"
+    thumbnail_key = f"thumbnails/{user.id}/{secrets.token_hex(16)}.jpg"
+    path = None
+    processed_path = None
+    thumbnail_path = None
+    uploaded_keys = []
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as temp_video:
+            path = temp_video.name
+            size = 0
+            while chunk := file.file.read(1024 * 1024):
+                size += len(chunk)
+                if size > 500 * 1024 * 1024:
+                    raise HTTPException(413, "Video exceeds 500 MB")
+                temp_video.write(chunk)
+        if size == 0:
+            raise HTTPException(400, "Video file is empty")
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", path],
+            check=True, capture_output=True, text=True, timeout=30,
+        )
+        duration = max(0, int(float(probe.stdout.strip())))
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as processed_video:
+            processed_path = processed_video.name
+        subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", path, "-map", "0:v:0", "-map", "0:a?",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart",
+                processed_path,
+            ],
+            check=True, capture_output=True, timeout=3600,
+        )
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as temp_thumbnail:
+            thumbnail_path = temp_thumbnail.name
+        subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", "0", "-i", processed_path, "-frames:v", "1", "-vf", "scale=640:-2", thumbnail_path],
+            check=True, capture_output=True, timeout=60,
+        )
+        uploaded_keys.append(video_key)
+        with open(processed_path, "rb") as source:
+            put_object(video_key, source, "video/mp4")
+        uploaded_keys.append(thumbnail_key)
+        with open(thumbnail_path, "rb") as source:
+            put_object(thumbnail_key, source.read(), "image/jpeg")
+        video = Video(
+            owner_id=user.id, title=clean_title, description=description.strip(),
+            object_key=video_key, thumbnail_key=thumbnail_key, duration_seconds=duration,
+            visibility=vis, status=VideoStatus.ready,
+        )
+        db.add(video)
+        db.commit()
+        db.refresh(video)
+        uploaded_keys.clear()
+        return serialize_video(video, db, user)
+    except HTTPException:
+        raise
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError) as error:
+        raise HTTPException(400, "Could not process this video file") from error
+    finally:
+        for key in uploaded_keys:
+            delete_object(key)
+        for temp_path in (path, processed_path, thumbnail_path):
+            if temp_path and os.path.exists(temp_path):
+                os.unlink(temp_path)
 
 
 @app.post("/api/videos/{video_id}/permissions")
@@ -241,15 +398,87 @@ def channel(username: str, db: Session = Depends(get_db), user: User | None = De
     channel_owner = db.query(User).filter(User.username == username).first()
     if not channel_owner:
         raise HTTPException(404, "Channel not found")
-    videos = db.query(Video).filter(Video.owner_id == channel_owner.id, Video.status != VideoStatus.hidden).order_by(Video.created_at.desc()).all()
+    videos = db.query(Video).filter(Video.owner_id == channel_owner.id, Video.status == VideoStatus.ready).order_by(Video.created_at.desc()).all()
     visible = [v for v in videos if can_view(v, user, db)]
     subscribed = bool(user and db.query(Subscription).filter_by(subscriber_id=user.id, channel_id=channel_owner.id).first())
+    playlists_query = db.query(Playlist).filter(
+        Playlist.owner_id == channel_owner.id,
+        Playlist.visibility == Visibility.public,
+    )
+    if user and user.id == channel_owner.id:
+        playlists_query = db.query(Playlist).filter(Playlist.owner_id == channel_owner.id)
+    playlists = playlists_query.order_by(Playlist.created_at.desc()).all()
     return {
         "channel": {"id": channel_owner.id, "username": channel_owner.username, "display_name": channel_owner.display_name},
         "subscribed": subscribed,
         "subscriber_count": db.query(func.count(Subscription.id)).filter(Subscription.channel_id == channel_owner.id).scalar(),
         "videos": [serialize_video(v, db, user) for v in visible],
+        "playlists": [{
+            "id": p.id,
+            "title": p.title,
+            "description": p.description,
+            "video_count": sum(1 for item in p.items if can_view(item.video, user, db)),
+        } for p in playlists],
     }
+
+
+@app.get("/api/playlists/{playlist_id}")
+def get_playlist(
+    playlist_id: int,
+    db: Session = Depends(get_db),
+    user: User | None = Depends(get_optional_user),
+):
+    playlist = db.get(Playlist, playlist_id)
+    if not playlist or (playlist.visibility == Visibility.private and (not user or user.id != playlist.owner_id)):
+        raise HTTPException(404, "Playlist not found")
+    return playlist_json(playlist, db, user)
+
+
+@app.post("/api/playlists")
+def create_playlist(
+    payload: PlaylistRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    title = payload.title.strip()
+    if not title or len(title) > 150:
+        raise HTTPException(400, "Playlist title must be between 1 and 150 characters")
+    try:
+        visibility = Visibility(payload.visibility)
+    except ValueError:
+        raise HTTPException(400, "Invalid visibility")
+    playlist = Playlist(
+        owner_id=user.id,
+        title=title,
+        description=payload.description.strip(),
+        visibility=visibility,
+    )
+    db.add(playlist)
+    db.commit()
+    db.refresh(playlist)
+    return playlist_json(playlist, db, user)
+
+
+@app.post("/api/playlists/{playlist_id}/videos")
+def add_playlist_video(
+    playlist_id: int,
+    payload: PlaylistItemRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    playlist = db.get(Playlist, playlist_id)
+    if not playlist or playlist.owner_id != user.id:
+        raise HTTPException(404, "Playlist not found")
+    video = db.get(Video, payload.video_id)
+    if not video or not can_view(video, user, db):
+        raise HTTPException(404, "Video not found")
+    if db.query(PlaylistVideo).filter_by(playlist_id=playlist.id, video_id=video.id).first():
+        raise HTTPException(409, "Video is already in this playlist")
+    position = db.query(func.max(PlaylistVideo.position)).filter_by(playlist_id=playlist.id).scalar()
+    db.add(PlaylistVideo(playlist_id=playlist.id, video_id=video.id, position=(position or 0) + 1))
+    db.commit()
+    db.refresh(playlist)
+    return playlist_json(playlist, db, user)
 
 
 @app.post("/api/channels/{username}/subscribe")
@@ -271,12 +500,25 @@ def subscribe(username: str, db: Session = Depends(get_db), user: User = Depends
     return {"subscribed": subscribed, "subscriber_count": count}
 
 
+@app.get("/api/subscriptions")
+def subscription_feed(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    channel_ids = db.query(Subscription.channel_id).filter(Subscription.subscriber_id == user.id).subquery()
+    videos = db.query(Video).filter(
+        Video.owner_id.in_(channel_ids),
+        Video.status == VideoStatus.ready,
+    ).order_by(Video.created_at.desc()).all()
+    return [serialize_video(video, db, user) for video in videos if can_view(video, user, db)]
+
+
 @app.post("/api/videos/{video_id}/report")
 def report_video(video_id: int, payload: ReportRequest, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     video = db.get(Video, video_id)
     if not video:
         raise HTTPException(404, "Video not found")
-    db.add(Report(video_id=video_id, reporter_id=user.id, reason=payload.reason.strip()))
+    reason = payload.reason.strip()
+    if not reason or len(reason) > 500:
+        raise HTTPException(400, "Report reason must be between 1 and 500 characters")
+    db.add(Report(video_id=video_id, reporter_id=user.id, reason=reason))
     db.commit()
     return {"ok": True}
 

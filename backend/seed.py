@@ -6,7 +6,7 @@ import time
 from sqlalchemy.exc import OperationalError
 
 from app.database import engine, SessionLocal, Base
-from app.models import User, Video, Comment, VideoStatus, Visibility
+from app.models import User, Video, Comment, Role, VideoStatus, Visibility
 from app.auth import hash_password
 from app.storage import ensure_bucket, put_object
 
@@ -23,21 +23,23 @@ else:
 ensure_bucket()
 db = SessionLocal()
 
-if db.query(User).filter_by(username="demo").first():
-    print("Database already seeded")
-    db.close()
-    raise SystemExit
-
-users = [
-    User(username="demo", email="demo@minetube.local", password_hash=hash_password("demo123"), display_name="Demo Creator"),
-    User(username="alice", email="alice@minetube.local", password_hash=hash_password("demo123"), display_name="Alice Travels"),
-    User(username="moderator", email="moderator@minetube.local", password_hash=hash_password("demo123"), display_name="Site Moderator", role="moderator"),
-    User(username="admin", email="admin@minetube.local", password_hash=hash_password("demo123"), display_name="Administrator", role="admin"),
+user_defaults = [
+    ("demo", "demo@minetube.local", "Demo Creator", Role.user),
+    ("alice", "alice@minetube.local", "Alice Travels", Role.user),
+    ("moderator", "moderator@minetube.local", "Site Moderator", Role.moderator),
+    ("admin", "admin@minetube.local", "Administrator", Role.admin),
 ]
-db.add_all(users)
+for username, email, display_name, role in user_defaults:
+    if not db.query(User).filter_by(username=username).first():
+        db.add(User(
+            username=username,
+            email=email,
+            password_hash=hash_password("demo123"),
+            display_name=display_name,
+            role=role,
+        ))
 db.commit()
-for u in users:
-    db.refresh(u)
+users = db.query(User).order_by(User.id).all()
 
 colors = [("demo", "0x1c5d99"), ("alice", "0x7b2cbf"), ("alice", "0x2d6a4f")]
 titles = [
@@ -48,9 +50,12 @@ titles = [
 
 for index, ((owner_name, color), (title, description)) in enumerate(zip(colors, titles)):
     owner = next(u for u in users if u.username == owner_name)
+    if db.query(Video).filter_by(owner_id=owner.id, title=title).first():
+        continue
     key = f"videos/{owner.id}/demo-{index + 1}.mp4"
     with tempfile.TemporaryDirectory() as temp:
         video_path = os.path.join(temp, "video.mp4")
+        thumbnail_path = os.path.join(temp, "thumbnail.jpg")
         subprocess.run([
             "ffmpeg", "-y", "-f", "lavfi", "-i", f"color=c={color}:s=1280x720:d=3",
             "-f", "lavfi", "-i", "sine=frequency=440:duration=3",
@@ -58,7 +63,11 @@ for index, ((owner_name, color), (title, description)) in enumerate(zip(colors, 
         ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         with open(video_path, "rb") as f:
             put_object(key, f.read(), "video/mp4")
-    video = Video(owner_id=owner.id, title=title, description=description, object_key=key, visibility=Visibility.public, status=VideoStatus.ready, views=(index + 1) * 120)
+        subprocess.run(["ffmpeg", "-y", "-i", video_path, "-frames:v", "1", thumbnail_path], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        thumb_key = f"thumbnails/{owner.id}/demo-{index + 1}.jpg"
+        with open(thumbnail_path, "rb") as f:
+            put_object(thumb_key, f.read(), "image/jpeg")
+    video = Video(owner_id=owner.id, title=title, description=description, object_key=key, thumbnail_key=thumb_key, duration_seconds=3, visibility=Visibility.public, status=VideoStatus.ready, views=(index + 1) * 120)
     db.add(video)
     db.commit()
     db.refresh(video)

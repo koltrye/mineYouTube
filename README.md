@@ -10,7 +10,7 @@ Requirements: Docker Engine and Docker Compose.
 bash deploy.sh
 ```
 
-Open `http://localhost:8000`. Swagger is at `http://localhost:8000/docs`.
+The deploy script creates a local `.env` with random database, JWT, and object-storage credentials, starts the services, then loads demo data. Open `http://localhost:8000`; Swagger is at `http://localhost:8000/docs`.
 
 ## Demo accounts
 
@@ -26,14 +26,13 @@ The seed process creates demo videos, comments, users, and a private-capable Min
 ## Run tests
 
 ```bash
+bash deploy.sh
 docker compose run --rm app pytest -q /app/tests
 ```
 
 ## Services
 
 - App and frontend: port 8000
-- PostgreSQL: internal port 5432
-- MinIO API: port 9000
-- MinIO console: port 9001
+- PostgreSQL and MinIO are private to the Compose network; video playback is streamed through the app.
 
-Set `JWT_SECRET` to a strong random value in `docker-compose.yml` or environment configuration for production.
+The demo credentials are for local evaluation only. Do not expose them as production accounts.

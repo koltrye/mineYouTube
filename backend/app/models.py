@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum as PyEnum
 from sqlalchemy import Boolean, Column, DateTime, Enum, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import relationship
@@ -32,7 +32,7 @@ class User(Base):
     display_name = Column(String(100), nullable=False)
     avatar_url = Column(String(500), nullable=True)
     role = Column(Enum(Role), default=Role.user, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     videos = relationship("Video", back_populates="owner")
 
 
@@ -48,7 +48,7 @@ class Video(Base):
     visibility = Column(Enum(Visibility), default=Visibility.public, nullable=False)
     status = Column(Enum(VideoStatus), default=VideoStatus.processing, nullable=False)
     views = Column(Integer, default=0)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     owner = relationship("User", back_populates="videos")
     comments = relationship("Comment", back_populates="video", cascade="all, delete-orphan")
 
@@ -58,7 +58,7 @@ class VideoLike(Base):
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     video_id = Column(Integer, ForeignKey("videos.id"), nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     __table_args__ = (UniqueConstraint("user_id", "video_id", name="uq_like_user_video"),)
 
 
@@ -68,7 +68,7 @@ class Comment(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     video_id = Column(Integer, ForeignKey("videos.id"), nullable=False, index=True)
     text = Column(Text, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     video = relationship("Video", back_populates="comments")
     user = relationship("User")
 
@@ -89,6 +89,33 @@ class VideoPermission(Base):
     __table_args__ = (UniqueConstraint("video_id", "user_id", name="uq_video_permission"),)
 
 
+class Playlist(Base):
+    __tablename__ = "playlists"
+    id = Column(Integer, primary_key=True)
+    owner_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    title = Column(String(150), nullable=False)
+    description = Column(Text, default="")
+    visibility = Column(Enum(Visibility), default=Visibility.public, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    owner = relationship("User")
+    items = relationship("PlaylistVideo", back_populates="playlist", cascade="all, delete-orphan", order_by="PlaylistVideo.position")
+
+
+class PlaylistVideo(Base):
+    __tablename__ = "playlist_videos"
+    id = Column(Integer, primary_key=True)
+    playlist_id = Column(Integer, ForeignKey("playlists.id"), nullable=False)
+    video_id = Column(Integer, ForeignKey("videos.id"), nullable=False)
+    position = Column(Integer, nullable=False, default=0)
+    added_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    playlist = relationship("Playlist", back_populates="items")
+    video = relationship("Video")
+    __table_args__ = (
+        UniqueConstraint("playlist_id", "video_id", name="uq_playlist_video"),
+        UniqueConstraint("playlist_id", "position", name="uq_playlist_position"),
+    )
+
+
 class Report(Base):
     __tablename__ = "reports"
     id = Column(Integer, primary_key=True)
@@ -96,5 +123,5 @@ class Report(Base):
     reporter_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     reason = Column(String(500), nullable=False)
     resolved = Column(Boolean, default=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
